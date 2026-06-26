@@ -7,6 +7,10 @@ on:
         description: Local run label
         required: true
         type: string
+      parts:
+        description: Shard count, 1..256
+        required: true
+        type: string
       analyzer_args_json:
         description: JSON list of analyzer CLI args
         required: true
@@ -21,6 +25,8 @@ jobs:
     outputs:
       asset: ${{ steps.asset.outputs.asset }}
       data_cache_key: ${{ steps.cache_key.outputs.data_cache_key }}
+      matrix_json: ${{ steps.matrix.outputs.matrix_json }}
+      parts: ${{ steps.matrix.outputs.parts }}
 
     steps:
       - uses: actions/checkout@v7
@@ -39,6 +45,21 @@ jobs:
           import os
           args = json.loads(os.environ["ANALYZER_ARGS_JSON"])
           print(f"asset={args[0]}")
+          PY
+
+      - name: Build shard matrix
+        id: matrix
+        env:
+          PARTS: ${{ inputs.parts }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          parts = int(os.environ["PARTS"])
+          if parts < 1 or parts > 256:
+              raise SystemExit("parts must be between 1 and 256")
+          print(f"parts={parts}")
+          print("matrix_json=" + json.dumps({"part": list(range(parts))}, separators=(",", ":")))
           PY
 
       - name: Build data cache key
@@ -72,88 +93,7 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: 20
-      matrix:
-        part:
-          - 0
-          - 1
-          - 2
-          - 3
-          - 4
-          - 5
-          - 6
-          - 7
-          - 8
-          - 9
-          - 10
-          - 11
-          - 12
-          - 13
-          - 14
-          - 15
-          - 16
-          - 17
-          - 18
-          - 19
-          - 20
-          - 21
-          - 22
-          - 23
-          - 24
-          - 25
-          - 26
-          - 27
-          - 28
-          - 29
-          - 30
-          - 31
-          - 32
-          - 33
-          - 34
-          - 35
-          - 36
-          - 37
-          - 38
-          - 39
-          - 40
-          - 41
-          - 42
-          - 43
-          - 44
-          - 45
-          - 46
-          - 47
-          - 48
-          - 49
-          - 50
-          - 51
-          - 52
-          - 53
-          - 54
-          - 55
-          - 56
-          - 57
-          - 58
-          - 59
-          - 60
-          - 61
-          - 62
-          - 63
-          - 64
-          - 65
-          - 66
-          - 67
-          - 68
-          - 69
-          - 70
-          - 71
-          - 72
-          - 73
-          - 74
-          - 75
-          - 76
-          - 77
-          - 78
-          - 79
+      matrix: ${{ fromJson(needs.prepare_data.outputs.matrix_json) }}
 
     steps:
       - uses: actions/checkout@v7
@@ -189,7 +129,7 @@ jobs:
           python run_shard.py
           --args-json "$ANALYZER_ARGS_JSON"
           --part ${{ matrix.part }}
-          --parts 80
+          --parts ${{ needs.prepare_data.outputs.parts }}
           --jobs 4
           --out-dir results
 
