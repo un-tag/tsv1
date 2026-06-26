@@ -11,6 +11,10 @@ on:
         description: Shard count, 1..256
         required: true
         type: string
+      asset:
+        description: Parsed analyzer asset
+        required: true
+        type: string
       analyzer_args_json:
         description: JSON list of analyzer CLI args
         required: true
@@ -35,17 +39,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Parse asset
+      - name: Set asset
         id: asset
-        env:
-          ANALYZER_ARGS_JSON: ${{ inputs.analyzer_args_json }}
         run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import os
-          args = json.loads(os.environ["ANALYZER_ARGS_JSON"])
-          print(f"asset={args[0]}")
-          PY
+          echo "asset=${{ inputs.asset }}" >> "$GITHUB_OUTPUT"
 
       - name: Build shard matrix
         id: matrix
