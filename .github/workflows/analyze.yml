@@ -15,7 +15,58 @@ on:
 run-name: tsv1 ${{ inputs.run_label }}
 
 jobs:
+  prepare_data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      asset: ${{ steps.asset.outputs.asset }}
+      data_cache_key: ${{ steps.cache_key.outputs.data_cache_key }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Parse asset
+        id: asset
+        env:
+          ANALYZER_ARGS_JSON: ${{ inputs.analyzer_args_json }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          args = json.loads(os.environ["ANALYZER_ARGS_JSON"])
+          print(f"asset={args[0]}")
+          PY
+
+      - name: Build data cache key
+        id: cache_key
+        run: |
+          sha=$(python download_asset.py --dataset-sha)
+          echo "data_cache_key=tsv1-data-${{ steps.asset.outputs.asset }}-$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Restore prepared asset data
+        id: restore_data
+        uses: actions/cache/restore@v6
+        with:
+          path: preprocessed/${{ steps.asset.outputs.asset }}
+          key: ${{ steps.cache_key.outputs.data_cache_key }}
+
+      - name: Download asset from Hugging Face
+        if: steps.restore_data.outputs.cache-hit != 'true'
+        run: python download_asset.py --asset "${{ steps.asset.outputs.asset }}" --data-dir preprocessed
+
+      - name: Save prepared asset data
+        if: steps.restore_data.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: preprocessed/${{ steps.asset.outputs.asset }}
+          key: ${{ steps.cache_key.outputs.data_cache_key }}
+
   analyze:
+    needs: prepare_data
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
@@ -105,12 +156,25 @@ jobs:
           - 79
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
+
+      - name: Restore prepared asset data
+        id: restore_data
+        uses: actions/cache/restore@v6
+        with:
+          path: preprocessed/${{ needs.prepare_data.outputs.asset }}
+          key: ${{ needs.prepare_data.outputs.data_cache_key }}
+
+      - name: Require prepared asset data
+        if: steps.restore_data.outputs.cache-hit != 'true'
+        run: |
+          echo "Prepared asset data cache was not found for ${{ needs.prepare_data.outputs.asset }}" >&2
+          exit 1
 
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
@@ -130,7 +194,7 @@ jobs:
           --out-dir results
 
       - name: Upload shard result
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shard-${{ matrix.part }}
           path: results/

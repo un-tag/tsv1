@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
-"""Download one asset from Hugging Face and run one analyzer shard."""
+"""Run one analyzer shard against a prepared local asset dataset."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
-import urllib.request
 from pathlib import Path
 
 from trigger_strategy import analyze_trigger
-from trigger_strategy.common import REQUIRED_ANALYZER_FILES
+from trigger_strategy.common import has_complete_analyzer_dataset
 from trigger_strategy.replay import NUMBA_AVAILABLE
-
-
-HF_BASE_URL = "https://huggingface.co/datasets/RooseveltHonaker/tsv1/resolve/main"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,16 +53,6 @@ def has_option(argv: list[str], option: str) -> bool:
     return False
 
 
-def download_asset(asset: str, data_dir: Path) -> None:
-    asset_dir = data_dir / asset
-    asset_dir.mkdir(parents=True, exist_ok=True)
-    for name in REQUIRED_ANALYZER_FILES:
-        dest = asset_dir / name
-        url = f"{HF_BASE_URL}/preprocessed/{asset}/{name}"
-        print(f"Downloading {asset}/{name}...", flush=True)
-        urllib.request.urlretrieve(url, dest)
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not NUMBA_AVAILABLE:
@@ -85,7 +71,9 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     data_dir = Path(args.data_dir)
-    download_asset(parsed.asset, data_dir)
+    if not has_complete_analyzer_dataset(data_dir / parsed.asset):
+        print(f"ERROR: missing prepared dataset for {parsed.asset} under {data_dir}", file=sys.stderr)
+        return 1
     shard_args = clean_args + [
         "--data-dir",
         str(data_dir),
