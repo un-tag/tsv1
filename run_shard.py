@@ -40,15 +40,19 @@ def strip_option(argv: list[str], option: str, *, has_value: bool = True) -> lis
             continue
         if has_value and value.startswith(option + "="):
             continue
+        if option.startswith("-") and not option.startswith("--") and has_value and value.startswith(option) and value != option:
+            continue
         cleaned.append(value)
     return cleaned
 
 
-def has_jobs_arg(argv: list[str]) -> bool:
-    for idx, value in enumerate(argv):
-        if value == "-j" or value == "--jobs":
-            return idx + 1 < len(argv)
-        if value.startswith("--jobs="):
+def has_option(argv: list[str], option: str) -> bool:
+    for value in argv:
+        if value == option:
+            return True
+        if option.startswith("--") and value.startswith(option + "="):
+            return True
+        if option.startswith("-") and not option.startswith("--") and value.startswith(option) and value != option:
             return True
     return False
 
@@ -72,10 +76,12 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(analyzer_args, list) or not all(isinstance(x, str) for x in analyzer_args):
         print("ERROR: --args-json must be a JSON list of strings", file=sys.stderr)
         return 2
+    if has_option(analyzer_args, "--data-dir"):
+        print("ERROR: --data-dir is not supported on runner shards; data is downloaded from Hugging Face", file=sys.stderr)
+        return 2
     parsed = analyze_trigger.parse_args(analyzer_args)
-    clean_args = strip_option(analyzer_args, "--data-dir")
-    if not has_jobs_arg(clean_args):
-        clean_args.extend(["-j", str(args.jobs)])
+    clean_args = strip_option(strip_option(analyzer_args, "-j"), "--jobs")
+    clean_args.extend(["-j", str(args.jobs)])
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     data_dir = Path(args.data_dir)
