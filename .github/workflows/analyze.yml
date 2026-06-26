@@ -119,9 +119,11 @@ jobs:
         run: python -c "from trigger_strategy.replay import NUMBA_AVAILABLE; raise SystemExit(0 if NUMBA_AVAILABLE else 2)"
 
       - name: Run shard
+        env:
+          ANALYZER_ARGS_JSON: ${{ inputs.analyzer_args_json }}
         run: >-
           python run_shard.py
-          --args-json '${{ inputs.analyzer_args_json }}'
+          --args-json "$ANALYZER_ARGS_JSON"
           --part ${{ matrix.part }}
           --parts 80
           --jobs 4
