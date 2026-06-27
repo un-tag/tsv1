@@ -289,6 +289,45 @@ def progress_work_total(
     return trigger_scan_work + replay_work
 
 
+def build_worker_chunks(
+    buy_prices: list[int],
+    sell_by_buy: dict[int, list[int]],
+    requested_jobs: int,
+) -> list[tuple[list[int], dict[int, list[int]]]]:
+    pair_total = sum(len(sell_by_buy[buy]) for buy in buy_prices)
+    if pair_total <= 0:
+        return []
+    jobs = min(max(1, int(requested_jobs)), pair_total)
+    chunk_sells: list[dict[int, list[int]]] = [{} for _ in range(jobs)]
+    chunk_buy_order: list[list[int]] = [[] for _ in range(jobs)]
+    chunk_work = [0 for _ in range(jobs)]
+    for buy in buy_prices:
+        sells = sell_by_buy[buy]
+        if len(buy_prices) >= jobs:
+            slot = min(range(jobs), key=lambda idx: chunk_work[idx])
+            chunk_sells[slot][buy] = list(sells)
+            chunk_buy_order[slot].append(buy)
+            chunk_work[slot] += len(sells)
+            continue
+        for sell in sells:
+            slot = min(range(jobs), key=lambda idx: chunk_work[idx])
+            if buy not in chunk_sells[slot]:
+                chunk_sells[slot][buy] = []
+                chunk_buy_order[slot].append(buy)
+            chunk_sells[slot][buy].append(sell)
+            chunk_work[slot] += 1
+    return [(buys, sells) for buys, sells in zip(chunk_buy_order, chunk_sells) if buys]
+
+
+def progress_work_total_for_chunks(
+    selected_start: int,
+    selected_end: int,
+    chunks: list[tuple[list[int], dict[int, list[int]]]],
+    use_amounts: list[int],
+) -> int:
+    return sum(progress_work_total(selected_start, selected_end, buys, sells, use_amounts) for buys, sells in chunks)
+
+
 def _worker_evaluate(
     data_dir: str,
     asset: str,
@@ -388,12 +427,10 @@ def evaluate_candidates(
     candidate_total = sum(len(sell_by_buy[buy]) for buy in buy_prices) * len(use_amounts)
     if candidate_total <= 0:
         return []
-    jobs = min(int(args.jobs), len(buy_prices))
-    total_work = progress_work_total(selected_start, selected_end, buy_prices, sell_by_buy, use_amounts)
+    chunks = build_worker_chunks(buy_prices, sell_by_buy, int(args.jobs))
+    jobs = len(chunks)
+    total_work = progress_work_total_for_chunks(selected_start, selected_end, chunks, use_amounts)
     print(f"  Evaluating {candidate_total:,} candidates with {jobs} worker{'s' if jobs != 1 else ''}...")
-    chunks = [[] for _ in range(jobs)]
-    for idx, buy in enumerate(buy_prices):
-        chunks[idx % jobs].append(buy)
     ctx = mp.get_context("spawn")
     rows = []
     t0 = time.monotonic()
@@ -415,15 +452,14 @@ def evaluate_candidates(
                 args.asset,
                 selected_start,
                 selected_end,
-                chunk,
-                sell_by_buy,
+                chunk_buy_prices,
+                chunk_sell_by_buy,
                 use_amounts,
                 shm.name,
                 jobs,
                 slot,
             )
-            for slot, chunk in enumerate(chunks)
-            if chunk
+            for slot, (chunk_buy_prices, chunk_sell_by_buy) in enumerate(chunks)
         ]
         while True:
             done_futures = sum(1 for future in futures if future.done())
