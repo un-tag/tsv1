@@ -11,7 +11,6 @@ import multiprocessing as mp
 import signal
 import sys
 import time
-from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from multiprocessing import shared_memory
@@ -19,6 +18,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+try:  # Optional locally, mandatory on the public runner.
+    from numba import njit
+except Exception:  # pragma: no cover - exercised only when numba is absent.
+    njit = None
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
@@ -37,7 +41,7 @@ from trigger_strategy.common import (  # noqa: E402
     parse_cli_bound_to_1e4,
     parse_cli_price_to_1e4,
 )
-from trigger_strategy.replay import simulate_candidates_for_buy_sell  # noqa: E402
+from trigger_strategy.replay import metric_row_to_dict, simulate_candidate_rows_for_buy_sell  # noqa: E402
 
 DEFAULT_DATA_DIR = SCRIPT_DIR / "preprocessed"
 TRIGGER_SCAN_PROGRESS_WINDOW_BLOCK = 1024
@@ -234,8 +238,10 @@ def partition_candidates(
 ) -> tuple[list[int], dict[int, list[int]]]:
     if int(parts) == 1:
         return buy_prices, sell_by_buy
-    selected = [buy for idx, buy in enumerate(buy_prices) if idx % int(parts) == int(part)]
-    return selected, {buy: sell_by_buy[buy] for buy in selected}
+    chunks = build_worker_chunks(buy_prices, sell_by_buy, int(parts))
+    if int(part) >= len(chunks):
+        return [], {}
+    return chunks[int(part)]
 
 
 def _counter_add(progress_counter: np.ndarray | None, progress_slot: int, value: int) -> None:
@@ -301,7 +307,9 @@ def build_worker_chunks(
     chunk_sells: list[dict[int, list[int]]] = [{} for _ in range(jobs)]
     chunk_buy_order: list[list[int]] = [[] for _ in range(jobs)]
     chunk_work = [0 for _ in range(jobs)]
-    for buy in buy_prices:
+    original_order = {buy: idx for idx, buy in enumerate(buy_prices)}
+    ordered_buys = sorted(buy_prices, key=lambda buy: (-len(sell_by_buy[buy]), original_order[buy]))
+    for buy in ordered_buys:
         sells = sell_by_buy[buy]
         if len(buy_prices) >= jobs:
             slot = min(range(jobs), key=lambda idx: chunk_work[idx])
@@ -316,7 +324,14 @@ def build_worker_chunks(
                 chunk_buy_order[slot].append(buy)
             chunk_sells[slot][buy].append(sell)
             chunk_work[slot] += 1
-    return [(buys, sells) for buys, sells in zip(chunk_buy_order, chunk_sells) if buys]
+    chunks: list[tuple[list[int], dict[int, list[int]]]] = []
+    for buys, sells in zip(chunk_buy_order, chunk_sells):
+        if not buys:
+            continue
+        ordered_chunk_buys = sorted(buys, key=lambda buy: original_order[buy])
+        ordered_chunk_sells = {buy: sells[buy] for buy in ordered_chunk_buys}
+        chunks.append((ordered_chunk_buys, ordered_chunk_sells))
+    return chunks
 
 
 def progress_work_total_for_chunks(
@@ -336,12 +351,13 @@ def _worker_evaluate(
     buy_prices: list[int],
     sell_by_buy: dict[int, list[int]],
     use_amounts: list[int],
+    emit_all: bool,
     progress_name: str | None = None,
     progress_slots: int = 0,
     progress_slot: int = -1,
-) -> list[dict[str, Any]]:
+) -> list[tuple[float, ...]]:
     dataset = load_dataset(data_dir, asset)
-    rows: list[dict[str, Any]] = []
+    rows: list[tuple[float, ...]] = []
     shm: shared_memory.SharedMemory | None = None
     progress_counter: np.ndarray | None = None
     if progress_name is not None and progress_slots > 0:
@@ -359,28 +375,64 @@ def _worker_evaluate(
                 progress_slot=progress_slot,
             )
             for sell in sell_by_buy[buy]:
-                metrics_rows = simulate_candidates_for_buy_sell(
-                    dataset["window_event_start"],
-                    dataset["window_outcome"],
-                    dataset["event_side"],
-                    dataset["event_price_1e4"],
-                    dataset["event_count_centi"],
-                    selected_start,
-                    selected_end,
-                    dataset["window_day_ord"],
-                    first_trigger,
-                    buy,
-                    sell,
-                    use_amounts,
-                    progress_counter=progress_counter,
-                    progress_slot=progress_slot,
+                rows.extend(
+                    simulate_candidate_rows_for_buy_sell(
+                        dataset["window_event_start"],
+                        dataset["window_outcome"],
+                        dataset["event_side"],
+                        dataset["event_price_1e4"],
+                        dataset["event_count_centi"],
+                        selected_start,
+                        selected_end,
+                        dataset["window_day_ord"],
+                        first_trigger,
+                        buy,
+                        sell,
+                        use_amounts,
+                        emit_all=emit_all,
+                        progress_counter=progress_counter,
+                        progress_slot=progress_slot,
+                    )
                 )
-                for metrics in metrics_rows:
-                    rows.append(asdict(metrics))
     finally:
         if shm is not None:
             shm.close()
     return rows
+
+
+if njit is not None:
+
+    @njit(cache=True, nogil=True)
+    def _compute_first_trigger_starts_numba(
+        window_event_start: np.ndarray,
+        event_price_1e4: np.ndarray,
+        selected_start: int,
+        selected_end: int,
+        buy_price_1e4: int,
+        progress_counter: np.ndarray,
+        progress_slot: int,
+    ) -> np.ndarray:
+        starts = np.full(int(selected_end) - int(selected_start), -1, dtype=np.int64)
+        since_progress = 0
+        use_progress = progress_slot >= 0 and len(progress_counter) > progress_slot
+        for offset in range(starts.size):
+            window_idx = int(selected_start) + offset
+            start = int(window_event_start[window_idx])
+            end = int(window_event_start[window_idx + 1])
+            first = -1
+            for event_idx in range(start, end):
+                if int(event_price_1e4[event_idx]) >= int(buy_price_1e4):
+                    first = event_idx
+                    break
+            starts[offset] = first
+            if use_progress:
+                since_progress += 1
+                if since_progress >= TRIGGER_SCAN_PROGRESS_WINDOW_BLOCK:
+                    progress_counter[progress_slot] += since_progress
+                    since_progress = 0
+        if use_progress and since_progress > 0:
+            progress_counter[progress_slot] += since_progress
+        return starts
 
 
 def compute_first_trigger_starts(
@@ -392,6 +444,18 @@ def compute_first_trigger_starts(
     progress_counter: np.ndarray | None = None,
     progress_slot: int = -1,
 ) -> np.ndarray:
+    if njit is not None:
+        counter = progress_counter if progress_counter is not None else np.empty(0, dtype=np.int64)
+        return _compute_first_trigger_starts_numba(
+            window_event_start,
+            event_price_1e4,
+            int(selected_start),
+            int(selected_end),
+            int(buy_price_1e4),
+            counter,
+            int(progress_slot),
+        )
+
     starts = np.full(int(selected_end) - int(selected_start), -1, dtype=np.int64)
     since_progress = 0
     for offset, window_idx in enumerate(range(int(selected_start), int(selected_end))):
@@ -423,6 +487,8 @@ def evaluate_candidates(
     buy_prices: list[int],
     sell_by_buy: dict[int, list[int]],
     use_amounts: list[int],
+    *,
+    fixed: bool,
 ) -> list[dict[str, Any]]:
     candidate_total = sum(len(sell_by_buy[buy]) for buy in buy_prices) * len(use_amounts)
     if candidate_total <= 0:
@@ -432,13 +498,13 @@ def evaluate_candidates(
     total_work = progress_work_total_for_chunks(selected_start, selected_end, chunks, use_amounts)
     print(f"  Evaluating {candidate_total:,} candidates with {jobs} worker{'s' if jobs != 1 else ''}...")
     ctx = mp.get_context("spawn")
-    rows = []
+    compact_rows: list[tuple[float, ...]] = []
     t0 = time.monotonic()
     shm = shared_memory.SharedMemory(create=True, size=jobs * np.dtype(np.int64).itemsize)
     progress = np.ndarray((jobs,), dtype=np.int64, buffer=shm.buf)
     progress.fill(0)
     executor: concurrent.futures.ProcessPoolExecutor | None = None
-    futures: list[concurrent.futures.Future[list[dict[str, Any]]]] = []
+    futures: list[concurrent.futures.Future[list[tuple[float, ...]]]] = []
     try:
         executor = concurrent.futures.ProcessPoolExecutor(
             max_workers=jobs,
@@ -455,6 +521,7 @@ def evaluate_candidates(
                 chunk_buy_prices,
                 chunk_sell_by_buy,
                 use_amounts,
+                fixed,
                 shm.name,
                 jobs,
                 slot,
@@ -474,7 +541,7 @@ def evaluate_candidates(
                 break
             time.sleep(1.0)
         for future in futures:
-            rows.extend(future.result())
+            compact_rows.extend(future.result())
         executor.shutdown(wait=True)
         executor = None
         print(f"\r  Work {total_work:,}/{total_work:,} complete{' ' * 40}")
@@ -494,7 +561,7 @@ def evaluate_candidates(
         shm.close()
         with suppress(FileNotFoundError):
             shm.unlink()
-    return rows
+    return [metric_row_to_dict(row) for row in compact_rows]
 
 
 def dollars(value_1e4: int | float) -> float:
@@ -626,7 +693,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"  Shard: {args.part + 1}/{args.parts}  buy triggers: {len(buy_prices):,}/{total_buy_prices:,}  "
                 f"trigger pairs: {shard_pairs:,}/{total_pairs:,}"
             )
-        rows = evaluate_candidates(args, dataset, selected_start, selected_end, buy_prices, sell_by_buy, use_amounts)
+        rows = evaluate_candidates(args, dataset, selected_start, selected_end, buy_prices, sell_by_buy, use_amounts, fixed=fixed)
         jsonl_rows = rows_for_output(rows, fixed=fixed)
         if args.out_jsonl:
             write_jsonl(args.out_jsonl, jsonl_rows)

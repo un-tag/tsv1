@@ -31,6 +31,58 @@ MODE_BUYING = 1
 MODE_SELLING = 2
 NUMBA_AVAILABLE = njit is not None
 REPLAY_PROGRESS_FLUSH_WINDOWS = 256
+MISSING_METRIC_INT = -1_000_000_000_000_000
+METRIC_FIELDS = (
+    "buy_price_1e4",
+    "sell_price_1e4",
+    "use_amount_dollars",
+    "total_windows",
+    "total_pnl_1e4",
+    "net_per_window_1e4",
+    "survival_budget_1e4",
+    "survival_score",
+    "max_drawdown_1e4",
+    "traded_windows",
+    "trigger_windows",
+    "positive_windows",
+    "positive_traded_windows",
+    "worst_window_1e4",
+    "cycles",
+    "stop_count",
+    "flip_count",
+    "avg_cash_used_1e4",
+    "max_cash_used_1e4",
+    "worst_1d_1e4",
+    "worst_3d_1e4",
+    "worst_7d_1e4",
+    "max_losing_streak",
+)
+METRIC_FIELD_COUNT = len(METRIC_FIELDS)
+METRIC_BUY_PRICE_IDX = 0
+METRIC_SELL_PRICE_IDX = 1
+METRIC_USE_AMOUNT_IDX = 2
+METRIC_TOTAL_WINDOWS_IDX = 3
+METRIC_TOTAL_PNL_IDX = 4
+METRIC_NET_PER_WINDOW_IDX = 5
+METRIC_SURVIVAL_BUDGET_IDX = 6
+METRIC_SURVIVAL_SCORE_IDX = 7
+METRIC_MAX_DRAWDOWN_IDX = 8
+METRIC_TRADED_WINDOWS_IDX = 9
+METRIC_TRIGGER_WINDOWS_IDX = 10
+METRIC_POSITIVE_WINDOWS_IDX = 11
+METRIC_POSITIVE_TRADED_WINDOWS_IDX = 12
+METRIC_WORST_WINDOW_IDX = 13
+METRIC_CYCLES_IDX = 14
+METRIC_STOP_COUNT_IDX = 15
+METRIC_FLIP_COUNT_IDX = 16
+METRIC_AVG_CASH_USED_IDX = 17
+METRIC_MAX_CASH_USED_IDX = 18
+METRIC_WORST_1D_IDX = 19
+METRIC_WORST_3D_IDX = 20
+METRIC_WORST_7D_IDX = 21
+METRIC_MAX_LOSING_STREAK_IDX = 22
+METRIC_FLOAT_FIELDS = frozenset(("net_per_window_1e4", "survival_score", "avg_cash_used_1e4"))
+METRIC_OPTIONAL_INT_FIELDS = frozenset(("worst_1d_1e4", "worst_3d_1e4", "worst_7d_1e4"))
 
 
 @dataclass
@@ -71,6 +123,30 @@ class CandidateMetrics:
     worst_3d_1e4: int | None
     worst_7d_1e4: int | None
     max_losing_streak: int
+
+
+def metric_row_to_dict(row: Sequence[float | int]) -> dict[str, int | float | None]:
+    payload: dict[str, int | float | None] = {}
+    for idx, field in enumerate(METRIC_FIELDS):
+        raw_value = row[idx]
+        if field in METRIC_FLOAT_FIELDS:
+            payload[field] = float(raw_value)
+        else:
+            value = int(raw_value)
+            if field in METRIC_OPTIONAL_INT_FIELDS and value == MISSING_METRIC_INT:
+                payload[field] = None
+            else:
+                payload[field] = value
+    return payload
+
+
+def metric_row_to_candidate(row: Sequence[float | int]) -> CandidateMetrics:
+    return CandidateMetrics(**metric_row_to_dict(row))  # type: ignore[arg-type]
+
+
+def require_numba_batch_replay() -> None:
+    if not NUMBA_AVAILABLE:
+        raise RuntimeError("Numba is required for batched trigger-strategy replay")
 
 
 def _buy_fill(cash_1e4: int, price_1e4: int, available_centi: int) -> tuple[int, int, int]:
@@ -640,6 +716,154 @@ if njit is not None:
         return pnl, traded, triggered, cycles, stops, flips, cash_used
 
 
+    @njit(cache=True, nogil=True)
+    def _rolling_worst_by_day_nb(pnl_values: np.ndarray, selected_day_ord: np.ndarray, days: int) -> int:
+        total_windows = pnl_values.size
+        if total_windows <= 0:
+            return MISSING_METRIC_INT
+
+        daily_values = np.empty(total_windows, dtype=np.int64)
+        day_count = 0
+        current_day = int(selected_day_ord[0])
+        current_total = 0
+        for idx in range(total_windows):
+            day = int(selected_day_ord[idx])
+            if day != current_day:
+                daily_values[day_count] = current_total
+                day_count += 1
+                current_day = day
+                current_total = 0
+            current_total += int(pnl_values[idx])
+        daily_values[day_count] = current_total
+        day_count += 1
+
+        if day_count < days:
+            return MISSING_METRIC_INT
+
+        rolling = 0
+        for idx in range(days):
+            rolling += int(daily_values[idx])
+        worst = rolling
+        for idx in range(days, day_count):
+            rolling += int(daily_values[idx]) - int(daily_values[idx - days])
+            if rolling < worst:
+                worst = rolling
+        return worst
+
+
+    @njit(cache=True, nogil=True)
+    def _aggregate_metrics_many_uses_numba(
+        buy_price_1e4: int,
+        sell_price_1e4: int,
+        use_amounts_dollars: np.ndarray,
+        pnl_values: np.ndarray,
+        traded_values: np.ndarray,
+        triggered_values: np.ndarray,
+        cycles_values: np.ndarray,
+        stop_values: np.ndarray,
+        flip_values: np.ndarray,
+        cash_used_values: np.ndarray,
+        selected_day_ord: np.ndarray,
+    ) -> np.ndarray:
+        n_uses = len(use_amounts_dollars)
+        total_windows = pnl_values.shape[1]
+        rows = np.empty((n_uses, METRIC_FIELD_COUNT), dtype=np.float64)
+
+        for use_idx in range(n_uses):
+            total_pnl = 0
+            cumulative = 0
+            peak = 0
+            max_drawdown = 0
+            traded_windows = 0
+            trigger_windows = 0
+            positive_windows = 0
+            positive_traded_windows = 0
+            worst_window = 0
+            cycles = 0
+            stop_count = 0
+            flip_count = 0
+            cash_used_total = 0
+            max_cash_used = 0
+            losing = 0
+            max_losing = 0
+
+            for window_idx in range(total_windows):
+                pnl = int(pnl_values[use_idx, window_idx])
+                total_pnl += pnl
+                cumulative += pnl
+                if cumulative > peak:
+                    peak = cumulative
+                drawdown = peak - cumulative
+                if drawdown > max_drawdown:
+                    max_drawdown = drawdown
+                if window_idx == 0 or pnl < worst_window:
+                    worst_window = pnl
+                if pnl < 0:
+                    losing += 1
+                    if losing > max_losing:
+                        max_losing = losing
+                else:
+                    losing = 0
+                if pnl > 0:
+                    positive_windows += 1
+
+                traded = int(traded_values[use_idx, window_idx])
+                triggered = int(triggered_values[use_idx, window_idx])
+                if traded > 0:
+                    traded_windows += 1
+                    if pnl > 0:
+                        positive_traded_windows += 1
+                if triggered > 0:
+                    trigger_windows += 1
+                cycles += int(cycles_values[use_idx, window_idx])
+                stop_count += int(stop_values[use_idx, window_idx])
+                flip_count += int(flip_values[use_idx, window_idx])
+                cash_used = int(cash_used_values[use_idx, window_idx])
+                cash_used_total += cash_used
+                if cash_used > max_cash_used:
+                    max_cash_used = cash_used
+
+            use_amount = int(use_amounts_dollars[use_idx])
+            use_floor = use_amount * 10_000
+            denom = max_drawdown
+            if use_floor > denom:
+                denom = use_floor
+            net_per_window = 0.0
+            avg_cash_used = 0.0
+            if total_windows > 0:
+                net_per_window = total_pnl / total_windows
+                avg_cash_used = cash_used_total / total_windows
+            survival_score = 0.0
+            if denom > 0:
+                survival_score = net_per_window / denom
+
+            rows[use_idx, METRIC_BUY_PRICE_IDX] = buy_price_1e4
+            rows[use_idx, METRIC_SELL_PRICE_IDX] = sell_price_1e4
+            rows[use_idx, METRIC_USE_AMOUNT_IDX] = use_amount
+            rows[use_idx, METRIC_TOTAL_WINDOWS_IDX] = total_windows
+            rows[use_idx, METRIC_TOTAL_PNL_IDX] = total_pnl
+            rows[use_idx, METRIC_NET_PER_WINDOW_IDX] = net_per_window
+            rows[use_idx, METRIC_SURVIVAL_BUDGET_IDX] = max_drawdown
+            rows[use_idx, METRIC_SURVIVAL_SCORE_IDX] = survival_score
+            rows[use_idx, METRIC_MAX_DRAWDOWN_IDX] = max_drawdown
+            rows[use_idx, METRIC_TRADED_WINDOWS_IDX] = traded_windows
+            rows[use_idx, METRIC_TRIGGER_WINDOWS_IDX] = trigger_windows
+            rows[use_idx, METRIC_POSITIVE_WINDOWS_IDX] = positive_windows
+            rows[use_idx, METRIC_POSITIVE_TRADED_WINDOWS_IDX] = positive_traded_windows
+            rows[use_idx, METRIC_WORST_WINDOW_IDX] = worst_window
+            rows[use_idx, METRIC_CYCLES_IDX] = cycles
+            rows[use_idx, METRIC_STOP_COUNT_IDX] = stop_count
+            rows[use_idx, METRIC_FLIP_COUNT_IDX] = flip_count
+            rows[use_idx, METRIC_AVG_CASH_USED_IDX] = avg_cash_used
+            rows[use_idx, METRIC_MAX_CASH_USED_IDX] = max_cash_used
+            rows[use_idx, METRIC_WORST_1D_IDX] = _rolling_worst_by_day_nb(pnl_values[use_idx], selected_day_ord, 1)
+            rows[use_idx, METRIC_WORST_3D_IDX] = _rolling_worst_by_day_nb(pnl_values[use_idx], selected_day_ord, 3)
+            rows[use_idx, METRIC_WORST_7D_IDX] = _rolling_worst_by_day_nb(pnl_values[use_idx], selected_day_ord, 7)
+            rows[use_idx, METRIC_MAX_LOSING_STREAK_IDX] = max_losing
+
+        return rows
+
+
 def aggregate_candidate_metrics(
     buy_price_1e4: int,
     sell_price_1e4: int,
@@ -699,76 +923,6 @@ def aggregate_candidate_metrics(
     )
 
 
-def aggregate_candidate_metrics_from_arrays(
-    buy_price_1e4: int,
-    sell_price_1e4: int,
-    use_amount_dollars: int,
-    pnl_values: np.ndarray,
-    traded_values: np.ndarray,
-    triggered_values: np.ndarray,
-    cycles_values: np.ndarray,
-    stop_values: np.ndarray,
-    flip_values: np.ndarray,
-    cash_used_values: np.ndarray,
-    selected_day_ord: np.ndarray,
-) -> CandidateMetrics:
-    pnl_i64 = np.asarray(pnl_values, dtype=np.int64)
-    total_windows = int(pnl_i64.size)
-    total_pnl = int(pnl_i64.sum()) if total_windows else 0
-    if total_windows:
-        cumulative = np.cumsum(pnl_i64)
-        peaks = np.maximum.accumulate(np.maximum(cumulative, 0))
-        drawdowns = peaks - cumulative
-        max_drawdown = int(drawdowns.max())
-        worst_window = int(pnl_i64.min())
-    else:
-        max_drawdown = 0
-        worst_window = 0
-
-    losing = 0
-    max_losing = 0
-    for pnl in pnl_i64:
-        if int(pnl) < 0:
-            losing += 1
-            max_losing = max(max_losing, losing)
-        else:
-            losing = 0
-
-    use_floor = int(use_amount_dollars) * MONEY_SCALE
-    denom = max(max_drawdown, use_floor)
-    net_per_window = total_pnl / total_windows if total_windows else 0.0
-    survival_score = net_per_window / denom if denom > 0 else 0.0
-    traded = int(np.asarray(traded_values, dtype=np.uint8).sum())
-    positive_mask = pnl_i64 > 0
-    traded_mask = np.asarray(traded_values, dtype=np.uint8) > 0
-    pnl_list = [int(x) for x in pnl_i64]
-    return CandidateMetrics(
-        buy_price_1e4=int(buy_price_1e4),
-        sell_price_1e4=int(sell_price_1e4),
-        use_amount_dollars=int(use_amount_dollars),
-        total_windows=total_windows,
-        total_pnl_1e4=total_pnl,
-        net_per_window_1e4=net_per_window,
-        survival_budget_1e4=max_drawdown,
-        survival_score=survival_score,
-        max_drawdown_1e4=max_drawdown,
-        traded_windows=traded,
-        trigger_windows=int(np.asarray(triggered_values, dtype=np.uint8).sum()),
-        positive_windows=int(positive_mask.sum()),
-        positive_traded_windows=int((positive_mask & traded_mask).sum()),
-        worst_window_1e4=worst_window,
-        cycles=int(np.asarray(cycles_values, dtype=np.int64).sum()),
-        stop_count=int(np.asarray(stop_values, dtype=np.int64).sum()),
-        flip_count=int(np.asarray(flip_values, dtype=np.int64).sum()),
-        avg_cash_used_1e4=(float(np.asarray(cash_used_values, dtype=np.int64).sum()) / total_windows if total_windows else 0.0),
-        max_cash_used_1e4=int(np.asarray(cash_used_values, dtype=np.int64).max()) if total_windows else 0,
-        worst_1d_1e4=_rolling_worst_by_day(pnl_list, selected_day_ord, 1),
-        worst_3d_1e4=_rolling_worst_by_day(pnl_list, selected_day_ord, 3),
-        worst_7d_1e4=_rolling_worst_by_day(pnl_list, selected_day_ord, 7),
-        max_losing_streak=max_losing,
-    )
-
-
 def simulate_candidate(
     window_event_start: np.ndarray,
     window_outcome: np.ndarray,
@@ -806,6 +960,65 @@ def simulate_candidate(
     )
 
 
+def simulate_candidate_rows_for_buy_sell(
+    window_event_start: np.ndarray,
+    window_outcome: np.ndarray,
+    event_side: np.ndarray,
+    event_price_1e4: np.ndarray,
+    event_count_centi: np.ndarray,
+    selected_window_start: int,
+    selected_window_end: int,
+    window_day_ord: np.ndarray,
+    first_trigger_event_idx: np.ndarray,
+    buy_price_1e4: int,
+    sell_price_1e4: int,
+    use_amounts_dollars: Sequence[int],
+    *,
+    emit_all: bool,
+    progress_counter: np.ndarray | None = None,
+    progress_slot: int = -1,
+) -> list[tuple[float, ...]]:
+    """Replay one buy/sell pair and return compact metric rows."""
+    require_numba_batch_replay()
+    use_array = np.asarray(use_amounts_dollars, dtype=np.int64)
+    counter = progress_counter if progress_counter is not None else np.empty(0, dtype=np.int64)
+    pnl, traded, triggered, cycles, stops, flips, cash_used = _simulate_windows_many_uses_numba(
+        window_event_start,
+        window_outcome,
+        event_side,
+        event_price_1e4,
+        event_count_centi,
+        selected_window_start,
+        selected_window_end,
+        first_trigger_event_idx,
+        int(buy_price_1e4),
+        int(sell_price_1e4),
+        use_array,
+        counter,
+        int(progress_slot),
+        int(len(use_array)),
+    )
+    selected_days = window_day_ord[int(selected_window_start):int(selected_window_end)]
+    metric_rows = _aggregate_metrics_many_uses_numba(
+        int(buy_price_1e4),
+        int(sell_price_1e4),
+        use_array,
+        pnl,
+        traded,
+        triggered,
+        cycles,
+        stops,
+        flips,
+        cash_used,
+        selected_days,
+    )
+    rows: list[tuple[float, ...]] = []
+    for idx in range(metric_rows.shape[0]):
+        if emit_all or metric_rows[idx, METRIC_NET_PER_WINDOW_IDX] > 0:
+            rows.append(tuple(float(value) for value in metric_rows[idx]))
+    return rows
+
+
 def simulate_candidates_for_buy_sell(
     window_event_start: np.ndarray,
     window_outcome: np.ndarray,
@@ -823,75 +1036,23 @@ def simulate_candidates_for_buy_sell(
     progress_slot: int = -1,
 ) -> list[CandidateMetrics]:
     """Replay one buy/sell pair, batching all use amounts over shared events."""
-    if NUMBA_AVAILABLE:
-        use_array = np.asarray(use_amounts_dollars, dtype=np.int64)
-        counter = progress_counter if progress_counter is not None else np.empty(0, dtype=np.int64)
-        pnl, traded, triggered, cycles, stops, flips, cash_used = _simulate_windows_many_uses_numba(
+    return [
+        metric_row_to_candidate(row)
+        for row in simulate_candidate_rows_for_buy_sell(
             window_event_start,
             window_outcome,
             event_side,
             event_price_1e4,
             event_count_centi,
-            int(selected_window_start),
-            int(selected_window_end),
+            selected_window_start,
+            selected_window_end,
+            window_day_ord,
             first_trigger_event_idx,
-            int(buy_price_1e4),
-            int(sell_price_1e4),
-            use_array,
-            counter,
-            int(progress_slot),
-            int(len(use_array)),
-        )
-        selected_days = window_day_ord[int(selected_window_start):int(selected_window_end)]
-        return [
-            aggregate_candidate_metrics_from_arrays(
-                buy_price_1e4,
-                sell_price_1e4,
-                int(use_amount),
-                pnl[idx],
-                traded[idx],
-                triggered[idx],
-                cycles[idx],
-                stops[idx],
-                flips[idx],
-                cash_used[idx],
-                selected_days,
-            )
-            for idx, use_amount in enumerate(use_amounts_dollars)
-        ]
-
-    per_use_results: list[list[WindowReplayResult]] = [[] for _ in use_amounts_dollars]
-    for offset, window_idx in enumerate(range(int(selected_window_start), int(selected_window_end))):
-        first = int(first_trigger_event_idx[offset])
-        if first < 0:
-            for idx, use_amount in enumerate(use_amounts_dollars):
-                per_use_results[idx].append(_zero_window_result(int(use_amount)))
-            if progress_counter is not None and progress_slot >= 0:
-                progress_counter[progress_slot] += len(use_amounts_dollars)
-            continue
-        end = int(window_event_start[window_idx + 1])
-        results = simulate_window_many_uses(
-            event_side[first:end],
-            event_price_1e4[first:end],
-            event_count_centi[first:end],
-            int(window_outcome[window_idx]),
             buy_price_1e4,
             sell_price_1e4,
             use_amounts_dollars,
+            emit_all=True,
+            progress_counter=progress_counter,
+            progress_slot=progress_slot,
         )
-        for idx, result in enumerate(results):
-            per_use_results[idx].append(result)
-        if progress_counter is not None and progress_slot >= 0:
-            progress_counter[progress_slot] += len(use_amounts_dollars)
-
-    selected_days = window_day_ord[int(selected_window_start):int(selected_window_end)]
-    return [
-        aggregate_candidate_metrics(
-            buy_price_1e4,
-            sell_price_1e4,
-            int(use_amount),
-            per_use_results[idx],
-            selected_days,
-        )
-        for idx, use_amount in enumerate(use_amounts_dollars)
     ]
